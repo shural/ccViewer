@@ -144,6 +144,7 @@ public class Cryptomator: ChildStorage {
     let V7_DIR = "dir.c9r"
     let V7_SYMLINK = "symlink.c9r"
     let V7_SHORT_SUFFIX = "c9s"
+    let V7_SUFFIX = ".c9r"
     let V7_SHORT_FILE = "contents.c9r"
     let V7_SHORT_NAME = "name.c9s"
 
@@ -1088,7 +1089,11 @@ public class Cryptomator: ChildStorage {
             return nil
         }
         
-        return BASE32.base32encode(input: Data(encryptedBytes))
+        if self.version == 6 {
+            return BASE32.base32encode(input: Data(encryptedBytes))
+        } else {
+            return BASE64.base64urlencode(input: Data(encryptedBytes))
+        }
     }
     
     func decryptFilename(ciphertextName: String, dirId: String) -> String? {
@@ -1299,12 +1304,32 @@ public class Cryptomator: ChildStorage {
                 }
                 let baseItem = items[0]
                 
+                /*
+                 V6 -
+                    1. Parent UUID + Foldername --> EncryptedName
+                    2. EncryptedName = '0' + EncryptedName
+                    3. newUUID --> FolderHash
+                    4. Create base storage folder (RemoteStorage.mkdir) @ $root/d/FolderHash[0..1]/FolderHash[2..31]
+                    5. Open temp file and write newUUID into the file
+                    6. Upload tempfile (s.upload) as EncryptedName to $root/d/ParentHash[0..1]/ParentHash[2..31]/
+                 
+                 V7 -
+                    2. EncryptedName = EncryptedName.c9r
+                    6. Create base storage folder @ $root/d/ParentHash[0..1]/ParentHash[2..31]/EncryptedName
+                    7. Upload tempfile as dir.c9r regular file in $root/d/ParentHash[0..1]/ParentHash[2..31]/EncryptedName
+                 */
+                
                 // generate encrypted BASE name from clear folder name and its parent folder UUID
                 guard let encFilename = self.encryptFilename(cleartextName: newname, dirId: parentDirId) else {
                     onFinish?(nil)
                     return
                 }
-                let encDirname = "0" + encFilename
+                var encDirname : String
+                if ( self.version == 6) {
+                    encDirname = "0" + encFilename
+                } else {
+                    encDirname = encFilename+self.V7_SUFFIX
+                }
                 // generate UUID for the folder, encrypt the UUID, and use the UUID to create folder in storage.
                 // Later on, as long as you get the UUID from encDirname content, you can locate the folder and then traverse all files in it.
                 let newDirId = UUID().uuidString.lowercased()
@@ -1319,6 +1344,7 @@ public class Cryptomator: ChildStorage {
                         return
                     }
                 }
+
                 
                 // if needed filename shorten
                 let deflatedName: String?
@@ -1333,6 +1359,16 @@ public class Cryptomator: ChildStorage {
                     group.enter()
                     self.uploadMetadataFile(shortName: deflatedName!, orgName: encDirname) { success in
                         metadataUploadDone = success
+                        group.leave()
+                    }
+                }
+                
+                if ( self.version == 7) {
+                    metadataUploadDone = false
+                    group.enter()
+                    let paths = baseItem.id.components(separatedBy: "/")
+                    self.makeParentStorage(path: [self.DATA_DIR_NAME, paths[3], paths[4], encDirname]) { item in
+                        metadataUploadDone = (item != nil)
                         group.leave()
                     }
                 }
@@ -1358,20 +1394,22 @@ public class Cryptomator: ChildStorage {
                     }
                     
                     // Upload new folder UUID as content
-                    s.upload(parentId: baseItem.id, sessionId: UUID().uuidString, uploadname: deflatedName ?? encDirname, target: target) { newBaseId in
+                    s.upload(parentId: (self.version == 6) ? baseItem.id : baseItem.id+encDirname, sessionId: UUID().uuidString, uploadname: (self.version==6) ? ( deflatedName ?? encDirname) : self.V7_DIR, target: target) { newBaseId in
                         guard let newBaseId = newBaseId else {
                             onFinish?(nil)
                             return
                         }
+                        //  V7, newBaseId is the dir.c9r...; V6, it is the file under parent folder
                         
                         CloudFactory.shared.data.persistentContainer.performBackgroundTask {
                             context in
                             var ret: String?
                             let fetchRequest = NSFetchRequest<NSFetchRequestResult>(entityName: "RemoteData")
+                            
                             fetchRequest.predicate = NSPredicate(format: "id == %@ && storage == %@", newBaseId, self.baseRootStorage)
                             if let result = try? context.fetch(fetchRequest), let items = result as? [RemoteData] {
                                 if let item = items.first {
-                                    let newid = "\(parentDirId)/\(deflatedName ?? encDirname)"
+                                    let newid = (self.version  == 6) ? "\(parentDirId)/\(deflatedName ?? encDirname)" : "\(parentDirId)/\(encDirname)"
                                     let newcdate = item.cdate
                                     let newmdate = item.mdate
                                     
