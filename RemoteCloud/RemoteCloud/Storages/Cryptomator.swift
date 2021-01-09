@@ -2268,11 +2268,14 @@ public class Cryptomator: ChildStorage {
                 onFinish?(nil)
                 return
             }
-            guard let encFilename = self.encryptFilename(cleartextName: uploadname, dirId: dirId) else {
+            var encFilename :String
+            encFilename = self.encryptFilename(cleartextName: uploadname, dirId: dirId) ?? ""
+            if ( encFilename == "") {
                 try? FileManager.default.removeItem(at: target)
                 onFinish?(nil)
                 return
             }
+            encFilename = (self.version == 7) ? encFilename + self.V7_SUFFIX : encFilename
             let deflatedName: String?
             let group = DispatchGroup()
             var metadataUploadDone = true
@@ -2307,7 +2310,7 @@ public class Cryptomator: ChildStorage {
                         return
                     }
                     if let crypttarget = self.processFile(target: target) {
-                        s.upload(parentId: baseItem.id, sessionId: sessionId, uploadname: deflatedName ?? encFilename, target: crypttarget) { newBaseId in
+                        s.upload(parentId: baseItem.id, sessionId: sessionId, uploadname: (self.version == 6) ? (deflatedName ?? encFilename) : encFilename, target: crypttarget) { newBaseId in
                             guard let newBaseId = newBaseId else {
                                 try? FileManager.default.removeItem(at: target)
                                 onFinish?(nil)
@@ -2321,7 +2324,7 @@ public class Cryptomator: ChildStorage {
                                 fetchRequest.predicate = NSPredicate(format: "id == %@ && storage == %@", newBaseId, self.baseRootStorage)
                                 if let result = try? context.fetch(fetchRequest), let items = result as? [RemoteData] {
                                     if let item = items.first {
-                                        let newid = "\(dirId)/\(deflatedName ?? encFilename)"
+                                        let newid = (self.version  == 6) ? "\(dirId)/\(deflatedName ?? encFilename)" : "\(dirId)/\(encFilename)"
                                         let newname = uploadname
                                         let newcdate = item.cdate
                                         let newmdate = item.mdate
