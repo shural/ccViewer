@@ -841,8 +841,8 @@ public class Cryptomator: ChildStorage {
                 } // end self.version check
                 
                 (t, encryptedName) = self.decodeFilename(encodedName: encodedName, t: t)
-                guard t != .broken else { return}
-                guard let decryptedName = self.decryptFilename(ciphertextName: encryptedName, dirId: dirId) else { return}
+                guard t != .broken else { continue}
+                guard let decryptedName = self.decryptFilename(ciphertextName: encryptedName, dirId: dirId) else { continue}
                 
                 // Skip files started with "."
                 if ( decryptedName.hasPrefix(".")) {continue}
