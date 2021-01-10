@@ -1831,6 +1831,7 @@ public class Cryptomator: ChildStorage {
         
         var parentPath1: String?
         let parentId = c.parent
+        /*
         if parentId != "" {
             if Thread.isMainThread {
                 let viewContext = CloudFactory.shared.data.persistentContainer.viewContext
@@ -1856,7 +1857,23 @@ public class Cryptomator: ChildStorage {
                     }
                 }
             }
+        }*/
+        
+        // Checking parent should be synchronous, based on current implementation (local search)
+        var parentVerified = false
+        let viewContext = CloudFactory.shared.data.persistentContainer.viewContext
+        
+        let fetchRequest = NSFetchRequest<NSFetchRequestResult>(entityName: "RemoteData")
+        fetchRequest.predicate = NSPredicate(format: "id == %@ && storage == %@", parentId, self.storageName ?? "")
+        if let result = try? viewContext.fetch(fetchRequest) {
+            if let items = result as? [RemoteData] {
+                parentPath1 = items.first?.path ?? ""
+                parentVerified = true
+            } else {
+                parentVerified = false
+            }
         }
+
         guard let parentPath = parentPath1 else {
             DispatchQueue.global().async {
                 onFinish?(nil)
@@ -1870,7 +1887,8 @@ public class Cryptomator: ChildStorage {
             onFinish?(nil)
             return
         }
-        let encFilename = c.isFolder ? "0"+ename : ename
+        // TODO -  c9s
+        let encFilename = (self.version == 6) ? (c.isFolder ? "0"+ename : ename) : (ename + self.V7_SUFFIX)
         let deflatedName: String?
         if encFilename.count <= 129 {
             deflatedName = nil
@@ -1900,7 +1918,7 @@ public class Cryptomator: ChildStorage {
                 }
                 let item = items[0]
                 group3.enter()
-                s.rename(fileId: item.id, newname: deflatedName ?? encFilename) { newId in
+                s.rename(fileId: item.id, newname: (self.version == 6) ? (deflatedName ?? encFilename) : encFilename) { newId in
                     defer {
                         group3.leave()
                     }
