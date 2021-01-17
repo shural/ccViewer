@@ -1456,7 +1456,282 @@ public class Cryptomator: ChildStorage {
         }
     }
     
+    /*
+     Delete folder. Skip checks on existing files in the folder.
+     */
+    func deleteFolder(folderID: String, folderHash: String, onFinish: ((Bool) -> Void)?) {
+        var success = false
+        
+        guard folderID != "" && folderHash != "" else { onFinish?(false); return}
+        guard let s = CloudFactory.shared[baseRootStorage] as? RemoteStorageBase else {onFinish?(false);return}
+        
+        let array = folderID.components(separatedBy: "/")
+        let parentDirId = array[0]
+        let deflateId = array[1]
+        guard let parentIdHash = getDirHash(dirId: parentDirId) else {return}
+
+        os_log("%{public}@", log: log, type: .debug, "deleteFolder(\(String(describing: type(of: self))):\(storageName ?? "") \(folderID)")
+        
+        let (itemType, encryptedName) = decodeFilename(encryptedName: deflateId)
+        guard itemType == .directory else {return}
+        
+        let deleteSem = DispatchSemaphore(value: 0)
+        // Now search parent folder and delete the item
+        self.findParentStorage(path: [self.DATA_DIR_NAME, String(parentIdHash.prefix(2)), String(parentIdHash.suffix(30))]) { items in
+            
+            let group = DispatchGroup()
+            var deleteSuccess = true
+            for item in items {
+                if (item.name != deflateId) { continue}
+                group.enter()
+                
+                if ( self.version == 7) {
+                    // need to delete dir.c9r in the folder first
+                    self.findParentStorage(path: [self.DATA_DIR_NAME, String(parentIdHash.prefix(2)), String(parentIdHash.suffix(30)), String(item.id)]) { tempItems in
+                        for item in tempItems {
+                            if ( item.name != self.V7_DIR) {continue}
+                            group.enter()
+                            s.deleteItem(fileId: item.id) { tempSuccess in
+                                group.leave()
+                            }
+                        }
+                    }
+                }
+                s.deleteItem(fileId: item.id) { success in
+                    defer { group.leave()}
+                    guard success else { deleteSuccess = false; return}
+                    
+                    self.findParentStorage(path: [self.DATA_DIR_NAME, String(folderHash.prefix(2))]) { tempItems in
+                        for item in tempItems {
+                            if ( item.name != String(folderHash.suffix(30))) {continue}
+                            group.enter()
+                            s.deleteItem(fileId: item.id) { tempSuccess in
+                                group.leave()
+                            }
+                        }
+                        
+                        deleteSem.signal()
+                    }
+               
+                }
+            } // end for
+            group.notify(queue: .global()) {
+                deleteSem.wait()
+                guard deleteSuccess else {
+                    onFinish?(false)
+                    return
+                }
+                self.purgeFileFromDirCache( fileID: folderID, parentDirID: parentDirId) { success in
+                    onFinish?(true)
+                }
+
+            }
+        }
+        
+    }
+    
+    func deleteRegularFile(fileID: String, onFinish: ((Bool) -> Void)?) {
+        var success = false
+        defer { onFinish?(success)}
+        
+        guard fileID != "" else {return}
+        guard let s = CloudFactory.shared[baseRootStorage] as? RemoteStorageBase else {return}
+        
+        let array = fileID.components(separatedBy: "/")
+        let parentDirId = array[0]
+        let deflateId = array[1]
+        guard let parentIdHash = getDirHash(dirId: parentDirId) else {return}
+
+        os_log("%{public}@", log: log, type: .debug, "deleteRegularFile(\(String(describing: type(of: self))):\(storageName ?? "") \(fileID)")
+        
+        if deflateId.hasSuffix(self.LONG_NAME_FILE_EXT) && (self.version == 6) {
+            //TODO - do it later
+            return
+        }
+        
+        let (itemType, encryptedName) = decodeFilename(encryptedName: deflateId)
+//        guard itemType == .regular else {return}
+      
+        self.findParentStorage(path: [self.DATA_DIR_NAME, String(parentIdHash.prefix(2)), String(parentIdHash.suffix(30))]) { items in
+            let group2 = DispatchGroup()
+            var deleteSuccess = true
+            for item in items {
+                if ( item.name != deflateId) { continue}
+                
+                group2.enter()
+                s.deleteItem(fileId: item.id) { success in
+                    defer { group2.leave()}
+                    guard success else { deleteSuccess = false; return}
+                    
+                    if item.name.hasSuffix(self.LONG_NAME_FILE_EXT) && (self.version  == 6) {
+                        let shortName = item.name
+                        group2.enter()
+                        self.findParentStorage(path: [self.METADATA_DIR_NAME, String(shortName.prefix(2)), String(shortName.dropFirst(2).prefix(2))]) { metaItems in
+                            defer { group2.leave()}
+                            
+                            for metaItem in metaItems {
+                                if ( metaItem.name != shortName) { continue}
+                                
+                                group2.enter()
+                                s.deleteItem(fileId: metaItem.id) { success2 in
+                                    defer { group2.leave()}
+                                    guard success2 else { deleteSuccess = false; return}
+                                }
+                                break
+
+                            } // endfor metaItem deletion
+                        }
+                    } // endif deletion meta data
+                    else if (self.version == 6) && (itemType == .directory) {
+                        
+                    }
+                } // endif deletion file
+                break
+            }
+            group2.notify(queue: .global()) {
+                guard deleteSuccess else {
+                    onFinish?(false)
+                    return
+                }
+                self.purgeFileFromDirCache( fileID: fileID, parentDirID: parentDirId) { success in
+                    onFinish?(true)
+                }
+
+            }
+        } // end of findParentStorage
+        
+    }
+  
+    //
+    func purgeFileFromDirCache(fileID: String, parentDirID: String, onFinish: ((Bool) ->Void)?) {
+        self.removeDirCache(dirId: parentDirID)
+        
+        CloudFactory.shared.data.persistentContainer.performBackgroundTask { context in
+            let fetchRequest = NSFetchRequest<NSFetchRequestResult>(entityName: "RemoteData")
+            fetchRequest.predicate = NSPredicate(format: "id == %@ && storage == %@", fileID, self.storageName!)
+            if let result = try? context.fetch(fetchRequest), let items = result as? [RemoteData] {
+                for item in items {
+                    context.delete(item)
+                }
+                try? context.save()
+            }
+            
+            DispatchQueue.global().async {
+                onFinish?(true)
+            }
+        }
+    }
+    
+    /*
+     cdate = nil;
+     ext = heic;
+     folder = 0;
+     hashstr = "";
+     id = "/WPRJLTKQ4B7IRV3NXFZPEQFAZSGVDM2XZT6MQZC2BGYQHRKPCY======";
+     mdate = "2021-01-09 12:28:47 +0000";
+     name = "IMG_210006.HEIC";
+     parent = "";
+     path = "v6:/IMG_210006.HEIC";
+     size = 2808983;
+     storage = v6;
+     subend = 0;
+     subid = nil;
+     subinfo = nil;
+     substart = 0;
+     */
     override func deleteItem(fileId: String, callCount: Int = 0, onFinish: ((Bool) -> Void)?) {
+        var success = false
+        
+        let fileID = fileId
+        guard fileID != "", let s = CloudFactory.shared[baseRootStorage] as? RemoteStorageBase else {onFinish?(success); return}
+        
+        var fileItem: RemoteData?
+        var filePath: String = ""
+        var parentVerified = false
+        let viewContext = CloudFactory.shared.data.persistentContainer.viewContext
+        
+        let fetchRequest = NSFetchRequest<NSFetchRequestResult>(entityName: "RemoteData")
+        fetchRequest.predicate = NSPredicate(format: "id == %@ && storage == %@", fileID, self.storageName ?? "")
+        if let result = try? viewContext.fetch(fetchRequest), let items = result as? [RemoteData] {
+            fileItem = items.first
+            filePath = items.first?.path ?? ""
+            parentVerified = true
+        } else {
+            // Cannot find the item
+            return
+        }
+
+        guard let validFileItem = fileItem else { return}
+        if ( !validFileItem.folder) {
+            self.deleteRegularFile(fileID: validFileItem.id!) { isSuccess in
+                onFinish?(isSuccess)
+                return
+            }
+            return
+        }   // End of handling regular file
+    
+        // Now this is a folder
+        let deleteSem = DispatchSemaphore(value: 0)
+        var dirIdHash: String = ""
+        let group2 = DispatchGroup()
+        
+        group2.enter()
+        self.resolveDirId(fileId: validFileItem.id!) { dirId in
+            guard let dirId = dirId else { return}
+            dirIdHash = self.getDirHash(dirId: dirId) ?? ""
+
+            group2.enter()
+            self.findParentStorage(path: [self.DATA_DIR_NAME, String(dirIdHash.prefix(2)), String(dirIdHash.suffix(30))]) { items in
+                
+                let deleteItemsGroup = DispatchGroup()
+                
+                for item in items {
+               
+                    deleteItemsGroup.enter()
+                    self.deleteItem( fileId: item.name, callCount: 0) { itemDeleteSuccess in
+                        success = success && itemDeleteSuccess
+                        deleteItemsGroup.leave()
+                    }
+                }
+                deleteItemsGroup.notify( queue: .global()) {
+                    group2.leave()
+                    deleteSem.signal()
+                }
+
+
+            } // end of findParentStorage
+            
+            group2.enter()
+            deleteSem.wait()    // Wait till all items in the folder are deleted
+            self.deleteFolder(folderID: validFileItem.id!, folderHash: dirIdHash) { isSuccess in
+                success = success && isSuccess
+                group2.leave()
+              
+            }
+            group2.leave()
+
+        }
+        
+        
+        
+        group2.notify(queue: .global()) {            
+            onFinish?(success)
+        }
+
+        
+/*
+        guard filePath != ""  else {
+            DispatchQueue.global().async {
+                onFinish?(false)
+            }
+            return
+        }
+ */
+        
+    }
+    
+//    override
+    func deleteItem_legacy(fileId: String, callCount: Int = 0, onFinish: ((Bool) -> Void)?) {
         guard fileId != "" else {
             onFinish?(false)
             return
